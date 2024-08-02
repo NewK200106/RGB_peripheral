@@ -131,6 +131,8 @@ _Python3_EXECUTABLE_DEBUG:INTERNAL=_Python3_EXECUTABLE_DEBUG-NOTFOUND
 //Python3 Properties
 _Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;9;13;64;<none>;cp39-win_amd64.pyd;;C:\ncs\toolchains\cf2149caf2\opt\bin\Lib;C:\ncs\toolchains\cf2149caf2\opt\bin\Lib;C:\ncs\toolchains\cf2149caf2\opt\bin\Lib\site-packages;C:\ncs\toolchains\cf2149caf2\opt\bin\Lib\site-packages
 _Python3_INTERPRETER_SIGNATURE:INTERNAL=dbd071e05222a4475ade3ed972e8fc4c
+//Interpreter reason failure
+_Python3_Interpreter_REASON_FAILURE:INTERNAL=
 //NumPy reason failure
 _Python3_NumPy_REASON_FAILURE:INTERNAL=
 
