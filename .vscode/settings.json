@@ -1,7 +1,25 @@
 {
   "files.associations": {
-    "gpio.h": "c",
-    "conn.h": "c",
-    "lbs.h": "c"
+    "array": "c",
+    "*.tcc": "c",
+    "string": "c",
+    "vector": "c",
+    "string_view": "c",
+    "functional": "c",
+    "limits": "c",
+    "ostream": "c",
+    "ratio": "c",
+    "streambuf": "c",
+    "tuple": "c",
+    "dk_buttons_and_leds.h": "c",
+    "soc.h": "c",
+    "soc_nrf_common.h": "c",
+    "bluetooth.h": "c",
+    "hci.h": "c",
+    "random": "c",
+    "new": "c",
+    "stdexcept": "c",
+    "system_error": "c",
+    "uart_async_adapter.h": "c"
   }
 }

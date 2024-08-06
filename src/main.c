@@ -1,152 +1,616 @@
 /*
- * Copyright (c) 2023 Nordic Semiconductor ASA
+ * Copyright (c) 2018 Nordic Semiconductor ASA
  *
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
+/** @file
+ *  @brief Nordic UART Bridge Service (NUS) sample
+ */
+#include "uart_async_adapter.h"
+
 #include <zephyr/types.h>
-#include <stddef.h>
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/sys/printk.h>
-#include <zephyr/sys/util.h>
-#include <stdio.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/usb/usb_device.h>
+#include <string.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <soc.h>
+#include "my_leds.h"
 #include <zephyr/bluetooth/bluetooth.h>
-#include <stdint.h>
-#include <zephyr/bluetooth/gap.h>
-#include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
-#include <zephyr/bluetooth/addr.h>
-//
-static uint32_t die_temp;
-//Deklaracja LEDów
-int ret_r;
-	int ret_g;
-	int ret_b; 
-#define LED1_NODE DT_ALIAS(led1)
-#define LED2_NODE DT_ALIAS(led2)
-#define LED3_NODE DT_ALIAS(led3)
-static const struct gpio_dt_spec led1 = 
-GPIO_DT_SPEC_GET(LED1_NODE, gpios);
-static const struct gpio_dt_spec led2 = 
-GPIO_DT_SPEC_GET(LED2_NODE, gpios);
-static const struct gpio_dt_spec led3 = 
-GPIO_DT_SPEC_GET(LED3_NODE, gpios);
-// Komunikaty do CMD
-LOG_MODULE_REGISTER(Lesson2_Exercise1, LOG_LEVEL_INF);
-//Deklaracja Bluetooth
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/hci.h>
+
+#include <bluetooth/services/nus.h>
+
+#include <dk_buttons_and_leds.h>
+
+#include <zephyr/settings/settings.h>
+
+#include <stdio.h>
+
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(Lesson4_Exercise3, LOG_LEVEL_INF);
+
+#define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
+#define PRIORITY 7
+
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
-//Struktura połączeń
-struct bt_conn *my_conn = NULL;
+#define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
+#define UART_WAIT_FOR_RX CONFIG_BT_NUS_UART_RX_WAIT_TIME
 
-//Struktura rozgłaszania
-static struct bt_le_adv_param *adv_param = BT_LE_ADV_PARAM(
-	(BT_LE_ADV_OPT_CONNECTABLE |
-	 BT_LE_ADV_OPT_USE_IDENTITY), /* Connectable advertising and use identity address */
-	BT_GAP_ADV_FAST_INT_MIN_1, /* 0x30 units, 48 units, 30ms */
-	BT_GAP_ADV_FAST_INT_MAX_1, /* 0x60 units, 96 units, 60ms */
-	NULL); /* Set to NULL for undirected advertising */
+static K_SEM_DEFINE(ble_init_ok, 0, 1);
 
+static struct bt_conn *current_conn;
+static struct bt_conn *auth_conn;
 
-/* STEP 4.1.1 - Declare the advertising packet */
-static const struct bt_data ad[] = {
-	/* STEP 4.1.2 - Set the advertising flags */
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	/* STEP 4.1.3 - Set the advertising packet data  */
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
+static struct k_work_delayable uart_work;
+//sending data
+static struct bt_nus_client *nus_client;
 
-};
+void send_data(const uint8_t *data, uint16_t len) {
+    int err;
 
-/* STEP 4.2.2 - Declare the URL data to include in the scan response */
-// static unsigned char url_data[] = {  0x01, /* URL Scheme Prefix http://www. */
-// 		      'r', 'b', '.', 'g', 'y', '/', 'a', 'w', 'u', 'p', '8', 'b' };
-
-/* STEP 4.2.1 - Declare the scan response packet */
-static const struct bt_data sd[] = {
-	
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
-		      BT_UUID_128_ENCODE(0x00001523, 0x1212, 0xefde, 0x1523, 0x785feabcd123)),
-};
-//Jak połączono to zrób to
-void on_connected(struct bt_conn *conn, uint8_t err)
-{
-	  
-	
-    if (err) {
-        LOG_ERR("Connection error %d", err);
+    if (!nus_client) {
+        printk("No NUS client connected\n");
         return;
     }
-    LOG_INF("Connected");
-    my_conn = bt_conn_ref(conn);
+
+    err = bt_nus_send(nus_client, data, len);
+    if (err) {
+        printk("Error sending data: %d\n", err);
+    }
+}
+//
+/* STEP 6.2 - Declare the struct of the data item of the FIFOs */
+struct uart_data_t {
+	void *fifo_reserved;
+	uint8_t data[CONFIG_BT_NUS_UART_BUFFER_SIZE];
+	uint16_t len;
+};
+
+/* STEP 6.1 - Declare the FIFOs */
+static K_FIFO_DEFINE(fifo_uart_tx_data);
+static K_FIFO_DEFINE(fifo_uart_rx_data);
+
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+};
+
+static const struct bt_data sd[] = {
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
+};
+
+#if CONFIG_BT_NUS_UART_ASYNC_ADAPTER
+UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
+#else
+static const struct device *const async_adapter;
+#endif
+
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+	ARG_UNUSED(dev);
+
+	static size_t aborted_len;
+	struct uart_data_t *buf;
+	static uint8_t *aborted_buf;
+	static bool disable_req;
+
+	switch (evt->type) {
+	case UART_TX_DONE:
+		LOG_DBG("UART_TX_DONE");
+		if ((evt->data.tx.len == 0) || (!evt->data.tx.buf)) {
+			return;
+		}
+
+		if (aborted_buf) {
+			buf = CONTAINER_OF(aborted_buf, struct uart_data_t,
+					   data[0]);
+			aborted_buf = NULL;
+			aborted_len = 0;
+		} else {
+			buf = CONTAINER_OF(evt->data.tx.buf, struct uart_data_t,
+					   data[0]);
+		}
+
+		k_free(buf);
+
+		buf = k_fifo_get(&fifo_uart_tx_data, K_NO_WAIT);
+		if (!buf) {
+			return;
+		}
+
+		if (uart_tx(uart, buf->data, buf->len, SYS_FOREVER_MS)) {
+			LOG_WRN("Failed to send data over UART");
+		}
+
+		break;
+
+	case UART_RX_RDY:
+		LOG_INF("UART_RX_RDY");
+		buf = CONTAINER_OF(evt->data.rx.buf, struct uart_data_t, data[0]);
+		buf->len += evt->data.rx.len;
+
+		if (disable_req) {
+			return;
+		}
+
+		if ((evt->data.rx.buf[buf->len - 1] == '\n') ||
+		    (evt->data.rx.buf[buf->len - 1] == '\r')) {
+			disable_req = true;
+			uart_rx_disable(uart);
+		}
+
+		break;
+
+	case UART_RX_DISABLED:
+		LOG_DBG("UART_RX_DISABLED");
+		disable_req = false;
+
+		buf = k_malloc(sizeof(*buf));
+		if (buf) {
+			buf->len = 0;
+		} else {
+			LOG_WRN("Not able to allocate UART receive buffer");
+			k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+			return;
+		}
+
+		uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+
+		break;
+
+	case UART_RX_BUF_REQUEST:
+		LOG_DBG("UART_RX_BUF_REQUEST");
+		buf = k_malloc(sizeof(*buf));
+		if (buf) {
+			buf->len = 0;
+			uart_rx_buf_rsp(uart, buf->data, sizeof(buf->data));
+		} else {
+			LOG_WRN("Not able to allocate UART receive buffer");
+		}
+
+		break;
+
+	case UART_RX_BUF_RELEASED:
+		LOG_DBG("UART_RX_BUF_RELEASED");
+		buf = CONTAINER_OF(evt->data.rx_buf.buf, struct uart_data_t,
+				   data[0]);
+
+		if (buf->len > 0) {
+			/* STEP 9.1 -  Push the data received from the UART peripheral into the fifo_uart_rx_data FIFO */
+			k_fifo_put(&fifo_uart_rx_data, buf);
+		} else {
+			k_free(buf);
+		}
+
+		break;
+
+	case UART_TX_ABORTED:
+		LOG_DBG("UART_TX_ABORTED");
+		if (!aborted_buf) {
+			aborted_buf = (uint8_t *)evt->data.tx.buf;
+		}
+
+		aborted_len += evt->data.tx.len;
+		buf = CONTAINER_OF((void *)aborted_buf, struct uart_data_t,
+				   data);
+
+		uart_tx(uart, &buf->data[aborted_len], buf->len - aborted_len, SYS_FOREVER_MS);
+
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void uart_work_handler(struct k_work *item)
+{
+	struct uart_data_t *buf;
+
+	buf = k_malloc(sizeof(*buf));
+	if (buf) {
+		buf->len = 0;
+	} else {
+		LOG_WRN("Not able to allocate UART receive buffer");
+		k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+		return;
+	}
+
+	uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+}
+
+static bool uart_test_async_api(const struct device *dev)
+{
+	const struct uart_driver_api *api = (const struct uart_driver_api *)dev->api;
+
+	return (api->callback_set != NULL);
+}
+
+static int uart_init(void)
+{
+	int err;
+	int pos;
+	struct uart_data_t *rx;
+	struct uart_data_t *tx;
+
+	if (!device_is_ready(uart)) {
+		return -ENODEV;
+	}
+
+	if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
+		err = usb_enable(NULL);
+		if (err && (err != -EALREADY)) {
+			LOG_ERR("Failed to enable USB");
+			return err;
+		}
+	}
+
+	rx = k_malloc(sizeof(*rx));
+	if (rx) {
+		rx->len = 0;
+	} else {
+		return -ENOMEM;
+	}
+
+	k_work_init_delayable(&uart_work, uart_work_handler);
+
+	if (IS_ENABLED(CONFIG_BT_NUS_UART_ASYNC_ADAPTER) && !uart_test_async_api(uart)) {
+		/* Implement API adapter */
+		uart_async_adapter_init(async_adapter, uart);
+		uart = async_adapter;
+	}
+
+	err = uart_callback_set(uart, uart_cb, NULL);
+	if (err) {
+		LOG_ERR("Cannot initialize UART callback");
+		return err;
+	}
+
+	if (IS_ENABLED(CONFIG_UART_LINE_CTRL)) {
+		LOG_INF("Wait for DTR");
+		while (true) {
+			uint32_t dtr = 0;
+
+			uart_line_ctrl_get(uart, UART_LINE_CTRL_DTR, &dtr);
+			if (dtr) {
+				break;
+			}
+			/* Give CPU resources to low priority threads. */
+			k_sleep(K_MSEC(100));
+		}
+		LOG_INF("DTR set");
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DCD, 1);
+		if (err) {
+			LOG_WRN("Failed to set DCD, ret code %d", err);
+		}
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DSR, 1);
+		if (err) {
+			LOG_WRN("Failed to set DSR, ret code %d", err);
+		}
+	}
+
+	tx = k_malloc(sizeof(*tx));
+
+	if (tx) {
+		pos = snprintf(tx->data, sizeof(tx->data),
+			       "Starting Nordic UART service example\r\n");
+
+		if ((pos < 0) || (pos >= sizeof(tx->data))) {
+			k_free(tx);
+			LOG_ERR("snprintf returned %d", pos);
+			return -ENOMEM;
+		}
+
+		tx->len = pos;
+	} else {
+		return -ENOMEM;
+	}
+	// Send a welcome message over UART
+	err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+	if (err) {
+		LOG_ERR("Cannot display welcome message (err: %d)", err);
+		return err;
+	}
+	// Enable start receiving data over UART
+	return uart_rx_enable(uart, rx->data, sizeof(rx->data), 50);
+}
+
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+	ret_b = B_ON;
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	if (err) {
+		LOG_ERR("Connection failed (err %u)", err);
+		return;
+	}
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("Connected %s", addr);
+
+	current_conn = bt_conn_ref(conn);
+
+
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Disconnected: %s (reason %u)", addr, reason);
+	ret_r = gpio_pin_configure_dt(&led1, GPIO_OUTPUT_ACTIVE);
+	ret_g = gpio_pin_configure_dt(&led2, GPIO_OUTPUT_ACTIVE);
+	ret_b= gpio_pin_configure_dt(&led3, GPIO_OUTPUT_ACTIVE);
+	if (auth_conn) {
+		bt_conn_unref(auth_conn);
+		auth_conn = NULL;
+	}
+
+	if (current_conn) {
+		bt_conn_unref(current_conn);
+		current_conn = NULL;
+		
+	}
+}
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (!err) {
+		LOG_INF("Security changed: %s level %u", addr, level);
+	} else {
+		LOG_WRN("Security failed: %s level %u err %d", addr, level, err);
+	}
+}
+#endif
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+	.security_changed = security_changed,
+#endif
+};
+
+#if defined(CONFIG_BT_NUS_SECURITY_ENABLED)
+static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Passkey for %s: %06u", addr, passkey);
+}
+
+static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	auth_conn = bt_conn_ref(conn);
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Passkey for %s: %06u", addr, passkey);
+	LOG_INF("Press Button 1 to confirm, Button 2 to reject.");
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing cancelled: %s", addr);
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing completed: %s, bonded: %d", addr, bonded);
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing failed conn: %s, reason %d", addr, reason);
+}
+
+static struct bt_conn_auth_cb conn_auth_callbacks = {
+	.passkey_display = auth_passkey_display,
+	.passkey_confirm = auth_passkey_confirm,
+	.cancel = auth_cancel,
+};
+
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks = { .pairing_complete =
+									pairing_complete,
+								.pairing_failed = pairing_failed };
+#else
+static struct bt_conn_auth_cb conn_auth_callbacks;
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
+#endif
+//For receiving and sending
+static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data, uint16_t len)
+{
+	int err;
+	char addr[BT_ADDR_LE_STR_LEN] = { 0 };
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, ARRAY_SIZE(addr));
+//Odbiór
+	LOG_INF("Received data from: %s %s", addr,data);
+	//Wysyłanie
+	char sranie[] ="JP: ";
+	char conscat[2048] ;
+	strcpy(conscat,sranie);
+	strcat(conscat,data);
+	bt_nus_send(NULL, conscat, len+3);
 	ret_r = gpio_pin_configure_dt(&led1, GPIO_OUTPUT_INACTIVE);
 	ret_g = gpio_pin_configure_dt(&led2, GPIO_OUTPUT_INACTIVE);
 	ret_b= gpio_pin_configure_dt(&led3, GPIO_OUTPUT_INACTIVE);
 
-    /* STEP 3.2  Turn the connection status LED on */
-}
-//Jak odłączono to
-void on_disconnected(struct bt_conn *conn, uint8_t reason)
-{
-    LOG_INF("Disconnected. Reason %d", reason);
-    bt_conn_unref(my_conn);
-		ret_r = gpio_pin_configure_dt(&led1, GPIO_OUTPUT_ACTIVE);
-	ret_g = gpio_pin_configure_dt(&led2, GPIO_OUTPUT_ACTIVE);
-	ret_b= gpio_pin_configure_dt(&led3, GPIO_OUTPUT_ACTIVE);
+	for (uint16_t pos = 0; pos != len;) {
+		struct uart_data_t *tx = k_malloc(sizeof(*tx));
 
-    /* STEP 3.3  Turn the connection status LED off */
+		if (!tx) {
+			LOG_WRN("Not able to allocate UART send data buffer");
+			return;
+		}
+
+		/* Keep the last byte of TX buffer for potential LF char. */
+		size_t tx_data_size = sizeof(tx->data) - 1;
+
+		if ((len - pos) > tx_data_size) {
+			tx->len = tx_data_size;
+		} else {
+			tx->len = (len - pos);
+		}
+
+		memcpy(tx->data, &data[pos], tx->len);
+
+		pos += tx->len;
+
+		/* Append the LF character when the CR character triggered
+		 * transmission from the peer.
+		 */
+		if ((pos == len) && (data[len - 1] == '\r')) {
+			tx->data[tx->len] = '\n';
+			tx->len++;
+		}
+		/* STEP 8.3 - Forward the data received over Bluetooth LE to the UART peripheral */
+		err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+		if (err) {
+			k_fifo_put(&fifo_uart_tx_data, tx);
+		}
+	}
 }
-struct bt_conn_cb connection_callbacks = {
-    .connected              = on_connected,
-    .disconnected           = on_disconnected,
+/* STEP 8.1 - Create a variable of type bt_nus_cb and initialize it */
+static struct bt_nus_cb nus_cb = {
+	.received = bt_receive_cb,
 };
 
-void nrf52_die_temperature_read(void)
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+static void num_comp_reply(bool accept)
 {
-    NRF_TEMP->TASKS_START = 1;//Start temperature measurement
-    while (NRF_TEMP->EVENTS_DATARDY == 0) {}
-    NRF_TEMP->EVENTS_DATARDY = 0;//Temperature measurement complete, data ready
-    die_temp = NRF_TEMP->TEMP ;
-    NRF_TEMP->TASKS_STOP = 1;  //Stop temperature measurement
+	if (accept) {
+		bt_conn_auth_passkey_confirm(auth_conn);
+		LOG_INF("Numeric Match, conn %p", (void *)auth_conn);
+	} else {
+		bt_conn_auth_cancel(auth_conn);
+		LOG_INF("Numeric Reject, conn %p", (void *)auth_conn);
+	}
+
+	bt_conn_unref(auth_conn);
+	auth_conn = NULL;
 }
+
+void button_changed(uint32_t button_state, uint32_t has_changed)
+{
+	uint32_t buttons = button_state & has_changed;
+
+	if (auth_conn) {
+		if (buttons & KEY_PASSKEY_ACCEPT) {
+			num_comp_reply(true);
+		}
+
+		if (buttons & KEY_PASSKEY_REJECT) {
+			num_comp_reply(false);
+		}
+	}
+}
+#endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
+
+
+
 int main(void)
 {
-	
-
-	nrf52_die_temperature_read();
-	float temp_c = (float)die_temp/4; 
-	char buf[6];
-	gcvt(temp_c,6,buf);
-    printk("die temperatured = %s \r\n ",buf);
-	printk("Elo wale wiadro \n");
-
 	int blink_status = 0;
-	int err;
-
-	LOG_INF("Starting Lesson 3 - Exercise 1 \n");
-	//Rejestracja wywołania
-	/* STEP 6 - Start advertising */
-
-	
+	int err = 0;
 
 
-	bt_conn_cb_register(&connection_callbacks);
+	/* STEP 7 - Initialize the UART Peripheral  */
+	err = uart_init();
+
+
+	if (IS_ENABLED(CONFIG_BT_NUS_SECURITY_ENABLED)) {
+		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+		if (err) {
+			LOG_ERR("Failed to register authorization callbacks.\n");
+			return -1;
+		}
+
+		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+		if (err) {
+			LOG_ERR("Failed to register authorization info callbacks.\n");
+			return -1;
+		}
+	}
 
 	err = bt_enable(NULL);
+
+
+	LOG_INF("Bluetooth initialized");
+
+	k_sem_give(&ble_init_ok);
+
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_load();
+	}
+	/* STEP 8.2 - Pass your application callback function to the NUS service */
+	err = bt_nus_init(&nus_cb);
 	if (err) {
-		LOG_ERR("Bluetooth init failed (err %d)", err);
+		LOG_ERR("Failed to initialize UART service (err: %d)", err);
 		return -1;
 	}
 
-	LOG_INF("Bluetooth initialized");
-	err = bt_le_adv_start(adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err) {
 		LOG_ERR("Advertising failed to start (err %d)", err);
 		return -1;
 	}
 
-	LOG_INF("Advertising successfully started");
+	// for (;;) {
+	// 	// dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
+	// 	// k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
 
-	
+	// }
 }
+/* STEP 9.3 - Define the thread function  */
+void ble_write_thread(void)
+{
+	/* Don't go any further until BLE is initialized */
+	k_sem_take(&ble_init_ok, K_FOREVER);
+
+	for (;;) {
+		/* Wait indefinitely for data from the UART peripheral */
+		struct uart_data_t *buf = k_fifo_get(&fifo_uart_rx_data, K_FOREVER);
+		/* Send data over Bluetooth LE to remote device(s) */
+	
+		if (bt_nus_send(NULL, buf->data, buf->len)) {
+			LOG_WRN("Failed to send data over BLE connection");
+		}
+		
+
+		k_free(buf);
+	}
+}
+/* STEP 9.2 - Create a dedicated thread for sending the data over Bluetooth LE. */
+K_THREAD_DEFINE(ble_write_thread_id, STACKSIZE, ble_write_thread, NULL, NULL, NULL, PRIORITY, 0, 0);
