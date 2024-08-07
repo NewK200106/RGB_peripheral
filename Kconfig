@@ -10,7 +10,7 @@ menu "Nordic UART BLE GATT service sample"
 
 config BT_NUS_THREAD_STACK_SIZE
 	int "Thread stack size"
-	default 1024
+	default 2048
 	help
 	  Stack size used of the ble_write_thread thread
 

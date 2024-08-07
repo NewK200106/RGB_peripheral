@@ -50,22 +50,7 @@ static struct bt_conn *auth_conn;
 
 static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
 static struct k_work_delayable uart_work;
-//sending data
-static struct bt_nus_client *nus_client;
 
-void send_data(const uint8_t *data, uint16_t len) {
-    int err;
-
-    if (!nus_client) {
-        printk("No NUS client connected\n");
-        return;
-    }
-
-    err = bt_nus_send(nus_client, data, len);
-    if (err) {
-        printk("Error sending data: %d\n", err);
-    }
-}
 //
 /* STEP 6.2 - Declare the struct of the data item of the FIFOs */
 struct uart_data_t {
@@ -437,8 +422,8 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 
 static struct bt_conn_auth_cb conn_auth_callbacks = {
 	.passkey_display = auth_passkey_display,
-	.passkey_confirm = auth_passkey_confirm,
 	.cancel = auth_cancel,
+	.pairing_confirm = NULL,
 };
 
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks = { .pairing_complete =
@@ -522,20 +507,7 @@ static void num_comp_reply(bool accept)
 	auth_conn = NULL;
 }
 
-void button_changed(uint32_t button_state, uint32_t has_changed)
-{
-	uint32_t buttons = button_state & has_changed;
 
-	if (auth_conn) {
-		if (buttons & KEY_PASSKEY_ACCEPT) {
-			num_comp_reply(true);
-		}
-
-		if (buttons & KEY_PASSKEY_REJECT) {
-			num_comp_reply(false);
-		}
-	}
-}
 #endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
 
 
@@ -544,7 +516,8 @@ int main(void)
 {
 	int blink_status = 0;
 	int err = 0;
-
+unsigned int passkey = 2137;
+bt_passkey_set(passkey);
 
 	/* STEP 7 - Initialize the UART Peripheral  */
 	err = uart_init();
